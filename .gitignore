@@ -15,3 +15,7 @@ crash.log
 # For built boxes
 *.box
 *.safetensors
+
+# For local run scripts and model files
+*_w_pruning
+*.sh
