@@ -1,13 +1,16 @@
 import argparse
 import os
 import torch
-from safetensors.torch import safe_open, save_file
+import json
+import shutil
+import glob
+from safetensors.torch import safe_open, save_file, load_file
 from typing import Dict, List
 
 
 def load_safetensors(file_path: str) -> Dict[str, torch.Tensor]:
     if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not exits: {file_path}")
+        raise FileNotFoundError(f"File not exists: {file_path}")
     
     try:
         with safe_open(file_path, framework="pt", device="cpu") as f:
@@ -17,26 +20,126 @@ def load_safetensors(file_path: str) -> Dict[str, torch.Tensor]:
         raise RuntimeError(f"Load safetensors failed: {e}")
 
 
+def load_safetensors_from_folder(folder_path: str) -> Dict[str, torch.Tensor]:
+    if not os.path.isdir(folder_path):
+        raise ValueError(f"Provided path is not a directory: {folder_path}")
 
-def filter_layer_weights(
+    safetensors_files = [
+        f for f in os.listdir(folder_path)
+        if f.endswith('.safetensors') and os.path.isfile(os.path.join(folder_path, f))
+    ]
+
+    if not safetensors_files:
+        raise FileNotFoundError(f"No .safetensors files found in {folder_path}")
+
+    index_files = [
+        f for f in os.listdir(folder_path)
+        if 'safetensors.index.json' in f and os.path.isfile(os.path.join(folder_path, f))
+    ]
+
+    if len(index_files) == 0:
+        if len(safetensors_files) != 1:
+            raise ValueError(
+                f"Expected exactly one .safetensors file when no index is present, "
+                f"but found {len(safetensors_files)}: {safetensors_files}"
+            )
+        file_path = os.path.join(folder_path, safetensors_files[0])
+        return load_safetensors(file_path)
+
+    elif len(index_files) == 1:
+        index_path = os.path.join(folder_path, index_files[0])
+        with open(index_path, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
+
+        weight_map = index_data.get('weight_map', {})
+        shard_files = list(dict.fromkeys(weight_map.values()))  
+
+        shard_paths = [os.path.join(folder_path, fname) for fname in shard_files]
+
+        for sp in shard_paths:
+            if not os.path.exists(sp):
+                raise FileNotFoundError(f"Missing shard file: {sp}")
+
+        weights = {}
+        for shard_path in shard_paths:
+            shard_weights = load_file(shard_path) 
+            weights.update(shard_weights)
+        return weights
+
+    else:
+        raise ValueError(f"Multiple index files found: {index_files}. Expected at most one.")
+
+
+def detect_layer_prefix_and_config(config_dict: dict, weights: Dict[str, torch.Tensor]) -> str:
+    num_layers = None
+    for key in ["num_hidden_layers", "n_layer", "num_layers"]:
+        if key in config_dict:
+            num_layers = config_dict[key]
+            break
+    if num_layers is None:
+        raise ValueError("Cannot find layer count in config.json")
+
+    candidates = [
+        "model.layers.",
+        "transformer.h.",
+        "encoder.layer.",
+        "decoder.block.",
+        "gpt_neox.layers.",
+        "blocks.",
+    ]
+
+    for prefix in candidates:
+        if any(k.startswith(f"{prefix}0.") for k in weights):
+            return prefix
+
+    for k in weights:
+        if ".0." in k:
+            parts = k.split(".")
+            for i, part in enumerate(parts):
+                if part == "0":
+                    guessed = ".".join(parts[:i])
+                    if any(f"{guessed}.{idx}." in w for idx in range(min(2, num_layers)) for w in weights):
+                        return guessed + "."
+    raise ValueError("Could not auto-detect layer prefix from weights.")
+
+
+def filter_layers_weights(
     weights: Dict[str, torch.Tensor],
-    layer_pattern: str,
-    exclude_other: bool = True
+    layer_indices: List[int],
+    layer_prefix: str,
+    keep_base: bool = True
 ) -> Dict[str, torch.Tensor]:
-    layer_weights = {k: v for k, v in weights.items() if layer_pattern in k}
-    
-    if not exclude_other:
-        # Retain the non-layer-related base weights (e.g., embedding, lm_head, etc.)
-        non_layer_weights = {k: v for k, v in weights.items() if not any(
-            # Match common layer naming patterns (compatible with different models)
-            pat in k for pat in ["layers.", "h.", "transformer.h.", "encoder.layer."]
-        )}
-        layer_weights.update(non_layer_weights)
-    
-    if not layer_weights:
-        raise ValueError(f"No weights found for pattern '{layer_pattern}', please check the layer name")
-    
-    return layer_weights
+    """
+    Keep only the specified layers (by original index) and optionally base weights.
+    Layer keys are NOT renamed.
+    """
+    layer_indices_set = set(layer_indices)
+    max_layer = max(layer_indices)
+
+    missing = []
+    for idx in layer_indices:
+        old_prefix = f"{layer_prefix}{idx}"
+        if not any(k.startswith(old_prefix) for k in weights):
+            missing.append(idx)
+    if missing:
+        raise ValueError(f"No weights found for layers: {missing}")
+
+    filtered = {}
+
+    for k, v in weights.items():
+        if k.startswith(layer_prefix):
+            try:
+                after_prefix = k[len(layer_prefix):]
+                layer_idx_str = after_prefix.split('.')[0]
+                layer_idx = int(layer_idx_str)
+                if layer_idx in layer_indices_set:
+                    filtered[k] = v
+            except (ValueError, IndexError):
+                continue
+        elif keep_base:
+            filtered[k] = v
+
+    return filtered
 
 
 def save_layer_safetensors(
@@ -44,42 +147,112 @@ def save_layer_safetensors(
     output_path: str,
     metadata: dict = None
 ) -> None:
-    
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
+    final_metadata = {"framework": "pt"}
+    if metadata:
+        final_metadata.update(metadata)
+
     try:
-        save_file(weights, output_path, metadata=metadata or {})
+        save_file(weights, output_path, metadata=final_metadata)
         print(f"Saved {len(weights)} weights to: {output_path}")
     except Exception as e:
         raise RuntimeError(f"Save safetensors failed: {e}")
 
 
+def parse_layers_arg(layers_str: str) -> List[int]:
+    """Parse layer argument like '0-3' or '0,1,2,3' or '0,2,4'"""
+    layers_str = layers_str.strip()
+    if '-' in layers_str and ',' not in layers_str:
+        start, end = map(int, layers_str.split('-'))
+        if start > end:
+            raise ValueError(f"Invalid layer range: {layers_str}")
+        return list(range(start, end + 1))
+    elif ',' in layers_str:
+        return [int(x.strip()) for x in layers_str.split(',') if x.strip()]
+    else:
+        return [int(layers_str)]
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Extract specified layer weights from safetensors")
-    parser.add_argument("--input", "-i", required=True, help="Input safetensors file path")
-    parser.add_argument("--output", "-o", required=True, help="Output safetensors file path")
-    parser.add_argument("--layer", "-l", required=True, help="Layer matching pattern (e.g., layers.0, h.3)")
-    parser.add_argument("--keep-base", action="store_true", 
-                        help="Whether to keep base weights (e.g., embedding, lm_head; default is to keep only specified layer)")
+    parser = argparse.ArgumentParser(description="Extract specific layers (e.g., 0-3) from HF model")
+    parser.add_argument("--input-dir", "-d", required=True, help="Input HuggingFace model directory")
+    parser.add_argument("--output-dir", "-o", required=True, help="Output HuggingFace model directory")
+    parser.add_argument("--layers", "-l", required=True, type=str, 
+                        help="Layer indices to extract, e.g. '0-3' or '0,1,2,3'")
+    parser.add_argument("--keep-base", action="store_true", default=True,
+                        help="Keep base weights (embeddings, lm_head, etc.). Default: True.")
     args = parser.parse_args()
     
     try:
-        print(f"Loading weights from: {args.input}")
-        raw_weights = load_safetensors(args.input)
-        print(f"Total weights: {len(raw_weights)}")
+        input_dir = os.path.abspath(args.input_dir)
+        output_dir = os.path.abspath(args.output_dir)
 
-        print(f"Selecting weights for layer '{args.layer}'...")
-        filtered_weights = filter_layer_weights(
-            raw_weights, 
-            layer_pattern=args.layer,
-            exclude_other=not args.keep_base
+        if not os.path.isdir(input_dir):
+            raise ValueError(f"Input directory does not exist: {input_dir}")
+
+        selected_layers = parse_layers_arg(args.layers)
+        print(f"Selected layers: {selected_layers}")
+
+        print(f"Copying entire directory from {input_dir} to {output_dir}...")
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        shutil.copytree(input_dir, output_dir)
+        print("Copy completed.")
+
+        config_path = os.path.join(output_dir, "config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"config.json not found in {input_dir}")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        print(f"Loading weights from original directory: {input_dir}")
+        raw_weights = load_safetensors_from_folder(input_dir)
+        print(f"Total weights loaded: {len(raw_weights)}")
+
+        layer_prefix = detect_layer_prefix_and_config(config, raw_weights)
+        print(f"Detected layer prefix: '{layer_prefix}'")
+
+        num_layers_orig = config.get("num_hidden_layers") or config.get("n_layer") or config.get("num_layers")
+        if num_layers_orig is None:
+            raise ValueError("Cannot find layer count in config.json")
+
+        for idx in selected_layers:
+            if not (0 <= idx < num_layers_orig):
+                raise ValueError(f"Layer index {idx} out of range [0, {num_layers_orig})")
+
+        print(f"Filtering layers: {selected_layers}...")
+        filtered_weights = filter_layers_weights(
+            raw_weights,
+            layer_indices=selected_layers,
+            layer_prefix=layer_prefix,
+            keep_base=args.keep_base
         )
         print(f"Filtered weights count: {len(filtered_weights)}")
 
-        save_layer_safetensors(filtered_weights, args.output)
-        
+        print("Removing old weight files...")
+        for f in glob.glob(os.path.join(output_dir, "*.safetensors")):
+            os.remove(f)
+        for f in glob.glob(os.path.join(output_dir, "*safetensors.index.json")):
+            os.remove(f)
+
+        new_weight_path = os.path.join(output_dir, "model.safetensors")
+        save_layer_safetensors(filtered_weights, new_weight_path)
+
+        new_num_layers = len(selected_layers)
+        config["num_hidden_layers"] = new_num_layers
+        if "n_layer" in config:
+            config["n_layer"] = new_num_layers
+        if "num_layers" in config:
+            config["num_layers"] = new_num_layers
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        print(f"Updated config.json with num_hidden_layers={new_num_layers}")
+
+        print(f"Model with layers {selected_layers} ready at: {output_dir}")
+
     except Exception as e:
         print(f"Error: {e}")
         exit(1)
